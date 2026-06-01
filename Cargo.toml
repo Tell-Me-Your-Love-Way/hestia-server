@@ -1,0 +1,19 @@
+[package]
+name = "hestia-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "*", features = ["full"] }
+tokio-cron-scheduler = "*"
+tracing = "*"
+tracing-subscriber = { version = "*", features = ["env-filter"] }
+
+# Parser de YAML e serialização
+serde = { version = "*", features = ["derive"] }
+serde_yaml = "*"
+glob = "*" # Para ler todos os arquivos .yaml de uma pasta facilmente
+
+# Cliente HTTP/3 (Importante ativar as features rustls e http3)
+reqwest = { version = "*", features = ["json", "stream", "rustls-tls", "http3"] }
+futures-util = "*" # Para manipular o stream de bytes do download
