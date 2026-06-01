@@ -1,17 +1,22 @@
 mod config;
 use config::HostConfig;
+use tokio::io::{BufWriter, AsyncWriteExt};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, error, debug};
 use reqwest::Client;
 use futures_util::StreamExt;
-use std::fs::{self, File};
-use std::io::Write;
+use tokio::fs::{self, File};
 use std::path::PathBuf;
 use std::collections::HashMap;
-
+// Adcionar Timeout Personalizado dos backups de maneira ao timeout nunca exceder com folga de 3 min o periodo de backup
+// Planejar Cadeia de Confiança de Certificação para comunicação entre hestia server e agent's
+// Configurar Secret no arquivo de config e criar cli do agent para configurar o secret e outras funcionalidades
+// Configurar Finalização Graciosa caso necessario interromper o backup
+// Rastrear os backups Ativos e Finalizados e loggar
+// Implementar API Rest Para config, monitoramento, auditabilidade, restauração ou mais
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().with_env_filter("backup_server=debug").init();
+    tracing_subscriber::fmt().with_env_filter("hestia-server=debug").init();
     info!("Iniciando Servidor de Backup HTTP/3...");
     
     let client = Client::builder()
@@ -54,7 +59,7 @@ async fn execute_backup(client: Client, host: &HostConfig) -> Result<(), Box<dyn
     let url = format!("{}/api", host.endpoint);
     
     let output_dir = format!("storage/{}", host.id);
-    fs::create_dir_all(&output_dir)?;
+    fs::create_dir_all(&output_dir).await?;
 
     for path in &host.paths {
         debug!(host = %host.id, path = %path, url = %url, "Enviando request de backup...");
@@ -87,7 +92,7 @@ async fn execute_backup(client: Client, host: &HostConfig) -> Result<(), Box<dyn
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-
+        // Modificar o Filename pra algo temporario a ser mudado no fim da escrita
         let filename = match download_filename {
             Some(name) => {
                 if name.ends_with(".tar.zst") {
@@ -104,21 +109,24 @@ async fn execute_backup(client: Client, host: &HostConfig) -> Result<(), Box<dyn
         };
 
         let file_path = format!("{}/{}", output_dir, filename);
-        let mut file = File::create(&file_path)?;
+        let file_pre = File::create(&file_path).await?;
+        
+        let mut file = BufWriter::new(file_pre);
         let mut stream = response.bytes_stream();
 
         debug!(host = %host.id, path = %path, "Recebendo payload do arquivo, escrevendo no disco...");
         
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result?;
-            file.write_all(&chunk)?;
+            file.write_all(&chunk).await?;
         }
-
+        // Lembrar  de Renomear o arquivo temporario pra versão definitiva e tratar falhas no temporario
+        file.flush().await?;
         info!(host = %host.id, path = %path, destino = %file_path, "Arquivo salvo e integrado com sucesso.");
     }
     
     if host.retention_versions > 0 {
-        if let Err(e) = apply_retention(&output_dir, host.retention_versions) {
+        if let Err(e) = apply_retention(&output_dir, host.retention_versions).await {
             error!(host = %host.id, "Erro ao aplicar retenção: {:?}", e);
         }
     }
@@ -126,17 +134,16 @@ async fn execute_backup(client: Client, host: &HostConfig) -> Result<(), Box<dyn
     Ok(())
 }
 
-fn apply_retention(output_dir: &str, retention_limit: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let entries = fs::read_dir(output_dir)?;
+async fn apply_retention(output_dir: &str, retention_limit: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let mut entries = fs::read_dir(output_dir).await?;
     let mut files = Vec::new();
 
-    for entry in entries {
-        let entry = entry?;
+    while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if path.is_file() {
             if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
                 if filename.ends_with(".tar.zst") {
-                    if let Ok(metadata) = entry.metadata() {
+                    if let Ok(metadata) = entry.metadata().await {
                         if let Ok(modified) = metadata.modified() {
                             files.push((path.clone(), filename.to_string(), modified));
                         }
@@ -153,6 +160,7 @@ fn apply_retention(output_dir: &str, retention_limit: usize) -> Result<(), Box<d
     let mut groups: HashMap<String, Vec<(PathBuf, std::time::SystemTime)>> = HashMap::new();
 
     for (full_path, filename, modified) in files {
+        // Modificar por perigo de Quebrar toda a aplicação
         let stem = &filename[..filename.len() - 8];
         let prefix = if let Some(last_dash_idx) = stem.rfind('-') {
             &stem[..last_dash_idx]
@@ -181,7 +189,7 @@ fn apply_retention(output_dir: &str, retention_limit: usize) -> Result<(), Box<d
             for i in 0..delete_count {
                 let (file_to_delete, _) = &group_files[i];
                 info!(arquivo = ?file_to_delete, "Removendo backup antigo devido à política de retenção...");
-                fs::remove_file(file_to_delete)?;
+                fs::remove_file(file_to_delete).await?;
             }
         }
     }
